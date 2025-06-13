@@ -1,5 +1,5 @@
 # Arduino Drone Quadcopter
-
+#### Author: Bocaletto Luca
 A fully featured 4-rotor drone with attitude stabilization, altitude hold, RC control, telemetry and safety features—all running on an Arduino Mega 2560.  
 
 ---
