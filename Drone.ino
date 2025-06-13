@@ -1,166 +1,198 @@
 // File: QuadPro.ino
 // Professional 4-rotor flight controller on Arduino Mega 2560
 // Author: Bocaletto Luca
+// Features:
+// - Attitude stabilization with MPU6050 DMP (roll, pitch, yaw)
+// - Altitude hold with BMP280 barometer
+// - RC input reading with failsafe & arming protocol
+// - ESC control via Servo library (1000–2000 µs pulses)
+// - Battery voltage monitoring with low-voltage cutoff
+// - Telemetry output on Serial1 in JSON format
+// - Modular PID controllers for roll, pitch, yaw & altitude
+
 #include <Wire.h>
+#include <Servo.h>
 #include <I2Cdev.h>
 #include <MPU6050.h>
 #include <Adafruit_BMP280.h>
 #include <PID_v1.h>
 
-// ===== Pin Definitions =====
-// ESC outputs
-const uint8_t ESC1_PIN = 6;
-const uint8_t ESC2_PIN = 7;
-const uint8_t ESC3_PIN = 8;
-const uint8_t ESC4_PIN = 9;
-// RC inputs (pulseIn)
-const uint8_t ROLL_CH_PIN     = 44;
-const uint8_t PITCH_CH_PIN    = 45;
-const uint8_t THROTTLE_CH_PIN = 46;
-const uint8_t YAW_CH_PIN      = 47;
+//=== Hardware Configuration ===
+// ESC PWM outputs
+const uint8_t ESC_PINS[4] = {6, 7, 8, 9};
+Servo esc[4];
 
-// ===== Objects =====
-MPU6050 mpu;
-Adafruit_BMP280 bmp;
-double rollAngle, pitchAngle, yawRate;
-double altitude, altitudeSet;
+// RC input channels (roll, pitch, throttle, yaw)
+const uint8_t RC_PINS[4] = {44, 45, 46, 47};
 
-// PID setpoints & outputs
-double rollSet, rollOut;
-double pitchSet, pitchOut;
-double yawSet, yawOut;
-double thrSet, thrOut;  // thrOut is altitude correction
+// Battery voltage monitor
+const uint8_t BATT_PIN        = A1;
+const float   BATT_DIV_RATIO  = 11.0;  // voltage divider ratio for 3S LiPo
 
-// PID tuning parameters (tweak in flight)
+// I2C addresses
+#define MPU_ADDR 0x68
+#define BMP_ADDR 0x76
+
+//=== Flight Control Parameters ===
+bool armed = false;
+unsigned long lastRC[4] = {0,0,0,0};
+const uint16_t RC_TIMEOUT     = 500;    // ms before RC channel considered lost
+
+// Setpoints and feedback variables
+double rollSet, pitchSet, yawSet, altSet;
+double rollAngle, pitchAngle, yawRate, altitude;
+
+// PID outputs
+double rollOut, pitchOut, yawOut, altOut;
+
+// PID tuning constants
 double Kp_r=4.0, Ki_r=0.02, Kd_r=2.0;
 double Kp_p=4.0, Ki_p=0.02, Kd_p=2.0;
 double Kp_y=3.0, Ki_y=0.01, Kd_y=1.0;
 double Kp_a=2.0, Ki_a=0.01, Kd_a=1.5;
 
-// PID objects
-PID pidRoll(&rollAngle, &rollOut, &rollSet, Kp_r, Ki_r, Kd_r, DIRECT);
-PID pidPitch(&pitchAngle, &pitchOut, &pitchSet, Kp_p, Ki_p, Kd_p, DIRECT);
-PID pidYaw(&yawRate, &yawOut, &yawSet, Kp_y, Ki_y, Kd_y, DIRECT);
-PID pidAlt(&altitude, &thrOut, &altitudeSet, Kp_a, Ki_a, Kd_a, DIRECT);
+// PID controllers
+PID pidRoll(&rollAngle,  &rollOut, &rollSet, Kp_r, Ki_r, Kd_r, DIRECT);
+PID pidPitch(&pitchAngle,&pitchOut,&pitchSet,Kp_p, Ki_p, Kd_p, DIRECT);
+PID pidYaw(&yawRate,    &yawOut,  &yawSet,  Kp_y, Ki_y, Kd_y, DIRECT);
+PID pidAlt(&altitude,   &altOut,  &altSet,  Kp_a, Ki_a, Kd_a, DIRECT);
 
-// ===== Utilities =====
-// Read RC PWM channel (1000–2000 µs)
-uint16_t readRC(uint8_t pin) {
-  uint32_t t = pulseIn(pin, HIGH, 30000);
-  return constrain(t, 1000, 2000);
+// Sensor objects
+MPU6050        mpu;
+Adafruit_BMP280 bmp;
+
+// DMP interrupt flag
+volatile bool dmpReady = false;
+void dmpISR() { dmpReady = true; }
+
+//=== Helper Functions ===
+// Read RC pulse width in µs (1000–2000), zero if no pulse
+uint16_t readPulse(uint8_t pin) {
+  uint32_t d = pulseIn(pin, HIGH, 30000);
+  return d ? constrain(d, 1000, 2000) : 0;
 }
 
-// Map PWM to −1…1 or 0…1
-double mapRC(double val, double inMin, double inMax, double outMin, double outMax) {
-  return (val - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
+// Map RC pulse to [-1,1] or [0,1]
+double mapRC(double v, double inMin, double inMax, double outMin, double outMax) {
+  return (v - inMin)*(outMax-outMin)/(inMax-inMin) + outMin;
 }
 
-// Write ESC: expects 1000–2000 µs pulse
-void writeESC(uint8_t pin, uint16_t pulse) {
-  // use Arduino’s Servo library if preferred; here we bit-bang
-  digitalWrite(pin, HIGH);
-  delayMicroseconds(pulse);
-  digitalWrite(pin, LOW);
+// Read battery voltage via divider
+float readBattery() {
+  int raw = analogRead(BATT_PIN);
+  float v = (raw/1023.0)*5.0*BATT_DIV_RATIO;
+  return v;
 }
 
-// ===== Setup =====
+// Send telemetry JSON on Serial1
+void sendTelemetry() {
+  Serial1.print("{\"r\":"); Serial1.print(rollAngle,1);
+  Serial1.print(",\"p\":");        Serial1.print(pitchAngle,1);
+  Serial1.print(",\"y\":");        Serial1.print(yawRate,1);
+  Serial1.print(",\"h\":");        Serial1.print(altitude,1);
+  Serial1.print(",\"b\":");        Serial1.print(readBattery(),2);
+  Serial1.println("}");
+}
+
 void setup() {
-  // Pins
-  pinMode(ESC1_PIN, OUTPUT);
-  pinMode(ESC2_PIN, OUTPUT);
-  pinMode(ESC3_PIN, OUTPUT);
-  pinMode(ESC4_PIN, OUTPUT);
-  
-  pinMode(ROLL_CH_PIN, INPUT);
-  pinMode(PITCH_CH_PIN, INPUT);
-  pinMode(THROTTLE_CH_PIN, INPUT);
-  pinMode(YAW_CH_PIN, INPUT);
-
   Serial.begin(115200);
-  Wire.begin();
+  Serial1.begin(57600);           // telemetry port
 
-  // Init MPU-6050
+  // Attach ESCs and initialize to min throttle
+  for (uint8_t i=0; i<4; i++) {
+    esc[i].attach(ESC_PINS[i], 1000, 2000);
+    esc[i].writeMicroseconds(1000);
+  }
+
+  // Configure RC inputs
+  for (uint8_t i=0; i<4; i++) pinMode(RC_PINS[i], INPUT);
+
+  // Battery pin
+  pinMode(BATT_PIN, INPUT);
+
+  // I2C & sensors
+  Wire.begin();
   mpu.initialize();
   mpu.dmpInitialize();
   mpu.setDMPEnabled(true);
-
-  // Init BMP280
-  if (!bmp.begin(0x76)) {
-    Serial.println("BMP280 failed");
-    while (1);
+  attachInterrupt(digitalPinToInterrupt(2), dmpISR, RISING);
+  if (!bmp.begin(BMP_ADDR)) {
+    Serial.println("BMP280 init failed"); while (1);
   }
 
-  // Initialize PIDs
-  pidRoll.SetMode(AUTOMATIC);
-  pidPitch.SetMode(AUTOMATIC);
-  pidYaw.SetMode(AUTOMATIC);
-  pidAlt.SetMode(AUTOMATIC);
-  pidRoll.SetOutputLimits(-200, 200);
-  pidPitch.SetOutputLimits(-200, 200);
-  pidYaw.SetOutputLimits(-200, 200);
-  pidAlt.SetOutputLimits(-200, 200);
-
-  // Zero references
-  altitudeSet = 0;
-  while (!mpu.dmpPacketAvailable()) {}
-  sensors_event_t gyroEvent, accelEvent;
+  // PID setup
+  pidRoll.SetMode(AUTOMATIC);   pidRoll.SetOutputLimits(-200,200);
+  pidPitch.SetMode(AUTOMATIC);  pidPitch.SetOutputLimits(-200,200);
+  pidYaw.SetMode(AUTOMATIC);    pidYaw.SetOutputLimits(-200,200);
+  pidAlt.SetMode(AUTOMATIC);    pidAlt.SetOutputLimits(-200,200);
 }
 
-// ===== Main Loop =====
 void loop() {
-  // 1) Read RC
-  double rollPWM     = readRC(ROLL_CH_PIN);
-  double pitchPWM    = readRC(PITCH_CH_PIN);
-  double thrPWM      = readRC(THROTTLE_CH_PIN);
-  double yawPWM      = readRC(YAW_CH_PIN);
-
-  rollSet  = mapRC(rollPWM, 1000, 2000, -1.0, 1.0);
-  pitchSet = mapRC(pitchPWM,1000,2000,-1.0,1.0);
-  yawSet   = mapRC(yawPWM,  1000,2000,-1.0,1.0);
-  thrSet   = mapRC(thrPWM,  1000,2000, 0.0,1.0);
-
-  // 2) Sensor feedback
-  if (mpu.dmpGetCurrentFIFOPacket()) {
-    mpu.dmpGetQuaternion(nullptr, nullptr);
-    mpu.dmpGetYawPitchRoll(nullptr, &pitchAngle, &rollAngle);
-    mpu.getRotation(&yawRate, nullptr, nullptr);
-    yawRate   /= 131.0;  // convert to deg/s
-  }
-  altitude = bmp.readAltitude(1013.25);   // sea-level pressure
-
-  // 3) Altitude setpoint ramp
-  if (thrSet > 0.1) {
-    altitudeSet += (thrSet - 0.1) * 0.02;  // slow climb
+  // 1) Read & validate RC channels
+  double rc[4];
+  for (uint8_t i=0; i<4; i++) {
+    rc[i] = readPulse(RC_PINS[i]);
+    if (rc[i]>0) lastRC[i] = millis();
+    else if (millis()-lastRC[i] > RC_TIMEOUT) {
+      // throttle lost → disarm, others center
+      rc[i] = (i==2 ? 1000 : 1500);
+      armed = false;
+    }
   }
 
-  // 4) Compute PIDs
-  pidRoll.Compute();
-  pidPitch.Compute();
-  pidYaw.Compute();
-  pidAlt.Compute();
+  // 2) Arming/disarming gestures
+  if (!armed && rc[3]<1100 && rc[2]<1100 && rc[0]>1400 && rc[1]>1400) {
+    armed = true; Serial.println("ARMED");
+  }
+  if (armed && rc[3]>1900) {
+    armed = false; Serial.println("DISARMED");
+  }
 
-  // 5) Motor mixing (microseconds)
-  int m1 = 1500 + thrPWM * 0.5 + rollOut + pitchOut - yawOut;
-  int m2 = 1500 + thrPWM * 0.5 - rollOut + pitchOut + yawOut;
-  int m3 = 1500 + thrPWM * 0.5 - rollOut - pitchOut - yawOut;
-  int m4 = 1500 + thrPWM * 0.5 + rollOut - pitchOut + yawOut;
-  m1 = constrain(m1, 1100, 1900);
-  m2 = constrain(m2, 1100, 1900);
-  m3 = constrain(m3, 1100, 1900);
-  m4 = constrain(m4, 1100, 1900);
+  // 3) Map RC to setpoints
+  rollSet  = mapRC(rc[0],1000,2000,-1,1);
+  pitchSet = mapRC(rc[1],1000,2000,-1,1);
+  altSet   = mapRC(rc[2],1000,2000, 0,1);
+  yawSet   = mapRC(rc[3],1000,2000,-1,1);
 
-  // 6) Output to ESCs
-  writeESC(ESC1_PIN, m1);
-  writeESC(ESC2_PIN, m2);
-  writeESC(ESC3_PIN, m3);
-  writeESC(ESC4_PIN, m4);
+  // 4) Get sensor feedback
+  if (dmpReady) {
+    dmpReady = false;
+    Quaternion q; VectorFloat g;
+    mpu.dmpGetCurrentFIFOPacket();
+    mpu.dmpGetQuaternion(&q, NULL);
+    mpu.dmpGetGravity(&g, &q);
+    mpu.dmpGetYawPitchRoll(&yawRate, &pitchAngle, &rollAngle, &q);
+    yawRate *= 180.0/3.14159;  // rad/s → deg/s
+  }
+  altitude = bmp.readAltitude(1013.25);
 
-  // 7) Safety: if extreme tilt, cut motors
-  if (abs(rollAngle) > 60 || abs(pitchAngle) > 60) {
-    writeESC(ESC1_PIN, 1000);
-    writeESC(ESC2_PIN, 1000);
-    writeESC(ESC3_PIN, 1000);
-    writeESC(ESC4_PIN, 1000);
-    while (1) {}
+  // 5) Compute PID outputs
+  pidRoll.Compute(); pidPitch.Compute();
+  pidYaw.Compute();  pidAlt.Compute();
+
+  // 6) Motor mixing
+  double baseThr = 1000 + altSet*1000;
+  int mix[4];
+  mix[0] = constrain(baseThr + pitchOut + rollOut - yawOut, 1000, 2000);
+  mix[1] = constrain(baseThr + pitchOut - rollOut + yawOut, 1000, 2000);
+  mix[2] = constrain(baseThr - pitchOut - rollOut - yawOut, 1000, 2000);
+  mix[3] = constrain(baseThr - pitchOut + rollOut + yawOut, 1000, 2000);
+
+  // 7) Send signals to ESCs
+  for (uint8_t i=0; i<4; i++) {
+    esc[i].writeMicroseconds(armed ? mix[i] : 1000);
+  }
+
+  // 8) Low-battery failsafe
+  if (readBattery() < 3.3*3) {
+    armed = false;
+    Serial.println("LOW BATT! DISARMED");
+  }
+
+  // 9) Telemetry
+  static unsigned long lastTel = 0;
+  if (millis() - lastTel > 200) {
+    sendTelemetry();
+    lastTel = millis();
   }
 }
