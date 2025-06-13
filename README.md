@@ -40,7 +40,22 @@ A fully featured 4-rotor drone with attitude stabilization, altitude hold, RC co
 
 ## 3. Wiring Diagram
 
+Arduino Mega        MPU-6050           BMP280            RC Receiver
+┌─────────────────┐ ┌───────┐         ┌───────┐         ┌─────────────────────┐
+│ 5 V    ──► VIN  │ │ VCC   │         │ VIN   │         │ Ch1 OUT ──► D44     │
+│ GND    ──► GND  │ │ GND   │         │ GND   │         │ Ch2 OUT ──► D45     │
+│ SDA    ──► 20   │ │ SDA   │◄────────│ SDA   │         │ Ch3 OUT ──► D46     │
+│ SCL    ──► 21   │ │ SCL   │◄────────│ SCL   │         │ Ch4 OUT ──► D47     │
+│ INT    ──► 2    │ └───────┘         └───────┘         └─────────────────────┘
+└─────────────────┘
 
+Arduino Mega        ESC Outputs         Motors (CW/CCW)
+┌─────────────────┐ ┌─────────────────┐ ┌───────────────────────────┐
+│ D6      ──► ESC1│─►│ PWM Out 1 ──►  │ M1 CW   │ Front-Left        │
+│ D7      ──► ESC2├─►│ PWM Out 2 ──►  │ M2 CCW  │ Front-Right       │
+│ D8      ──► ESC3│─►│ PWM Out 3 ──►  │ M3 CW   │ Rear-Right        │
+│ D9      ──► ESC4│─►│ PWM Out 4 ──►  │ M4 CCW  │ Rear-Left         │
+└─────────────────┘ └─────────────────┘ └───────────────────────────┘
 
 - **ESC PWM**: standard 400 Hz PWM (0–2000 µs pulse) on D6–D9.  
 - **RC Inputs**: pulseIn on D44–D47 (roll, pitch, throttle, yaw).  
